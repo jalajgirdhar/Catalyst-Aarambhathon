@@ -8,11 +8,13 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from stockwise.cashguard import allocate
 from stockwise.business import ALL as PROFILES, detect
 from stockwise.data import clean_sales, last_sunday, make_demo
 from stockwise.explain import explain
 from stockwise.festivals import default_calendar, load_calendar
 from stockwise.forecast import MODEL_LABEL, forecast_all, prophet_available
+from stockwise.inventory import demand_windows
 from stockwise.pipeline import build_plans, plans_table, prepare_inventory, read_inventory
 from stockwise.simulate import simulate, summarise
 from stockwise.trends import claude_ideas, google_trends, own_signals, pilot_units
@@ -188,6 +190,11 @@ with tabs["🛒 Shopping list"]:
                                                           help="Leave blank to use the suggestion"),
         },
     )
+    inv_by = inv.set_index("product")
+
+    def adj_of(e):
+        return float(inv_by.loc[e, "forecast_change_pct"] or 0)
+
     plans = build_plans(inv, fcs, cleaned.dow, service, cover_days, slow_days)
     sel = "All"
     if multi:
@@ -203,6 +210,63 @@ with tabs["🛒 Shopping list"]:
     st.subheader("Shopping list, most urgent first")
     show_df(table)
     st.download_button("Download shopping list (CSV)", table.to_csv(index=False), "stockwise_shopping_list.csv", "text/csv")
+    st.subheader("💰 CashGuard: order within your budget")
+    if not any(p.order_cost > 0 for p in plans):
+        st.caption("Add unit costs in the table above to turn on CashGuard.")
+    else:
+        budget = st.number_input("Cash you can spend on stock now (Rs). 0 means no limit.", min_value=0, step=5000,
+                                 value=0, key="budget")
+        alloc = allocate(view, float(budget))
+        if alloc.empty:
+            st.caption("Nothing to order right now.")
+        else:
+            spend = float(alloc["spend"].sum())
+            need = float((alloc["wanted"] * alloc["unit_cost"]).sum())
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Your budget (Rs)", "No limit" if budget <= 0 else f"{budget:,.0f}")
+            m2.metric("Planned spend (Rs)", f"{spend:,.0f}")
+            m3.metric("Cash left (Rs)", "-" if budget <= 0 else f"{max(budget - spend, 0):,.0f}")
+            m4.metric("Still needed (Rs)", f"{max(need - spend, 0):,.0f}")
+            risk = []
+            for r in alloc.itertuples():
+                if r.status == "Fully funded":
+                    risk.append("-")
+                elif "later" in r.urgency and not pd.isna(r.reorder_date):
+                    risk.append(f"Can wait: order by {r.reorder_date:%d %b}")
+                elif r.cover >= 999:
+                    risk.append("-")
+                else:
+                    risk.append(f"{r.cover:.0f} days of stock left, supplier needs {r.lead}")
+            cg = pd.DataFrame({
+                "Priority": alloc["rank"],
+                **({"Company": [meta.loc[e, "company"] for e in alloc["product"]]} if multi else {}),
+                "Product": [meta.loc[e, "item"] for e in alloc["product"]],
+                "Funding": alloc["status"],
+                "Reorder by": ["-" if pd.isna(d) else f"{d:%d %b %Y}" for d in alloc["reorder_date"]],
+                "Wanted": alloc["wanted"], "Can buy now": alloc["funded"],
+                "Spend (Rs)": alloc["spend"].round(0), "Risk if not fully funded": risk})
+            show_df(cg)
+            st.download_button("Download budget plan (CSV)", cg.to_csv(index=False), "stockwise_budget_plan.csv", "text/csv")
+            urgent_short = alloc[(~alloc["urgency"].str.contains("later")) & (alloc["status"] != "Fully funded")]
+            if budget > 0 and not urgent_short.empty:
+                st.warning("Your budget does not cover all the urgent orders. Ask your supplier for credit on the "
+                           "items still short, or order the rest as soon as cash comes in.")
+            elif budget > 0 and need > spend:
+                st.info("All urgent orders are covered. The unfunded orders are not due yet, so you can fund them "
+                        "later, by their reorder dates.")
+
+    with st.expander("Expected demand for every product: next 7, 15 and 30 days"):
+        dw_rows = []
+        for p in view:
+            w = demand_windows(fcs[p.product], cleaned.dow, adj_of(p.product))
+            row = {"Company": meta.loc[p.product, "company"]} if multi else {}
+            row["Product"] = meta.loc[p.product, "item"]
+            for k in (7, 15, 30):
+                row[f"Next {k} days"] = f"{w['mid'][k]:.0f} ({w['low'][k]:.0f} to {w['high'][k]:.0f})"
+            dw_rows.append(row)
+        show_df(pd.DataFrame(dw_rows))
+        st.caption("Units, with the likely range in brackets.")
+
     for p in view:
         if p.gap_days > 0:
             st.warning(f"**{label[p.product]}** will run out in about {p.cover_days:.0f} days but your supplier needs "
@@ -212,11 +276,6 @@ with tabs["🛒 Shopping list"]:
                     f"(Rs {p.stock_value:,.0f}). Hold new orders and consider a discount.")
 
 by_name = {p.product: p for p in plans}
-inv_by = inv.set_index("product")
-
-
-def adj_of(e):
-    return float(inv_by.loc[e, "forecast_change_pct"] or 0)
 
 
 with tabs["📈 Item forecast"]:
@@ -227,6 +286,12 @@ with tabs["📈 Item forecast"]:
     k1.metric("Reorder by", "No order needed" if plan.reorder_date is None else f"{plan.reorder_date:%d %b}")
     k2.metric("Order qty", plan.final_qty)
     k3.metric("Stock cover", ">250 days" if plan.cover_days >= 999 else f"{plan.cover_days:.0f} days")
+
+    dw = demand_windows(fc, cleaned.dow, adj)
+    w1, w2, w3 = st.columns(3)
+    for col, k in zip((w1, w2, w3), (7, 15, 30)):
+        col.metric(f"Expected sales, next {k} days", f"{dw['mid'][k]:.0f} units",
+                   delta=f"likely {dw['low'][k]:.0f} to {dw['high'][k]:.0f}", delta_color="off")
 
     hist = fc.history.iloc[-16:]
     mean = fc.mean * (1 + adj / 100)
